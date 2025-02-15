@@ -1,7 +1,10 @@
 extern crate base64;
+extern crate dryoc;
 extern crate futures;
 extern crate hyper;
-extern crate libhydrogen;
+
+use dryoc::dryocbox::*;
+
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
@@ -9,11 +12,11 @@ extern crate serde_json;
 extern crate tokio;
 
 use futures::future;
-use hyper::{Body, Chunk, Request, Response, StatusCode};
 use hyper::rt::{Future, Stream};
-use libhydrogen::secretbox::Key;
-use serde::Serialize;
+use hyper::{Body, Chunk, Request, Response, StatusCode};
+
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::SocketAddr;
@@ -23,8 +26,6 @@ use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::timer::Interval;
-
-const HYDRO_CONTEXT: &'static str = "ssetoken";
 
 type Clients = Vec<Client>;
 type Channels<C> = HashMap<C, Clients>;
@@ -44,7 +45,8 @@ type Channels<C> = HashMap<C, Clients>;
 pub struct Server<C> {
     channels: Mutex<Channels<C>>,
     next_id: AtomicUsize,
-    token_key: Key,
+    token_key: dryoc::classic::crypto_secretbox::Key,
+    nonce: dryoc::classic::crypto_secretbox::Nonce,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -56,13 +58,13 @@ struct AuthToken<C> {
 impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
     /// Create a new SSE push-server.
     pub fn new() -> Server<C> {
-        libhydrogen::init()
-            .expect("could not init libhydrogen");
+        //libhydrogen::init().expect("could not init libhydrogen");
 
         Server {
+            nonce: dryoc::classic::crypto_secretbox::Nonce::gen(),
             channels: Mutex::new(HashMap::new()),
             next_id: AtomicUsize::new(0),
-            token_key: Key::gen(),
+            token_key: dryoc::classic::crypto_secretbox::crypto_secretbox_keygen(),
         }
     }
 
@@ -72,7 +74,12 @@ impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
     /// clients on the given channel, if any.
     ///
     /// Returns an error if the serialization fails.
-    pub fn push<S: Serialize>(&self, channel: C, event: &str, message: &S) -> Result<(), serde_json::error::Error> {
+    pub fn push<S: Serialize>(
+        &self,
+        channel: C,
+        event: &str,
+        message: &S,
+    ) -> Result<(), serde_json::error::Error> {
         let payload = serde_json::to_string(message)?;
         let message = format!("event: {}\ndata: {}\n\n", event, payload);
 
@@ -89,23 +96,35 @@ impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
     /// an appropriate http error response is returned.
     pub fn create_stream(&self, request: &Request<Body>) -> Response<Body> {
         use base64::{decode_config, URL_SAFE_NO_PAD};
-        use libhydrogen::secretbox::decrypt;
+        use dryoc::classic::crypto_secretbox::crypto_secretbox_open_easy;
+        use dryoc::constants::CRYPTO_SECRETBOX_MACBYTES;
 
         // Extract channel from uri path (last segment)
-        let channel = request.uri().path()
-            .rsplit('/').next()
+        let channel = request
+            .uri()
+            .path()
+            .rsplit('/')
+            .next()
             .and_then(|channel_str| C::from_str(channel_str).ok());
 
         // Extract auth token from query, decode, decrypt and deserialize
-        let token = request.uri().query()
+        let nonce = self.nonce.clone();
+        let key = self.token_key.clone();
+
+        let token = request
+            .uri()
+            .query()
             .and_then(|query| decode_config(query, URL_SAFE_NO_PAD).ok())
-            .and_then(|opaque_token| decrypt(
-                &opaque_token, 0, &HYDRO_CONTEXT.into(),
-                &self.token_key).ok()
-            )
-            .and_then(|token_str|
-                serde_json::from_slice::<AuthToken<C>>(&token_str).ok()
-            );
+            .and_then(|opaque_token| {
+                // Decrypt
+                let mut decrypted = vec![0u8; opaque_token.len() - CRYPTO_SECRETBOX_MACBYTES];
+                let res = crypto_secretbox_open_easy(&mut decrypted, &opaque_token, &nonce, &key);
+                match res.err() {
+                    Some(_) => None,
+                    None => Some(decrypted),
+                }
+            })
+            .and_then(|token_str| serde_json::from_slice::<AuthToken<C>>(&token_str).ok());
 
         // Check if the request contained a valid channel and token
         let (channel, token) = match (channel, token) {
@@ -157,17 +176,26 @@ impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
     /// as the query url segment to the sse endpoint.
     ///
     /// Returns an error if the channel serialization fails.
-    pub fn generate_auth_token(&self, channel: Option<C>) -> Result<String, serde_json::error::Error> {
+    pub fn generate_auth_token(
+        &self,
+        channel: Option<C>,
+    ) -> Result<String, serde_json::error::Error> {
         use base64::{encode_config, URL_SAFE_NO_PAD};
-        use libhydrogen::secretbox::encrypt;
+
+        use dryoc::classic::crypto_secretbox::crypto_secretbox_easy;
+        use dryoc::constants::CRYPTO_SECRETBOX_MACBYTES;
 
         let token = AuthToken {
             created: SystemTime::now(),
             allowed_channel: channel,
         };
         let token = serde_json::to_vec(&token)?;
+        // Encrypt
+        let nonce = self.nonce.clone();
+        let key = self.token_key.clone();
+        let mut ciphertext = vec![0u8; token.len() + CRYPTO_SECRETBOX_MACBYTES];
+        crypto_secretbox_easy(&mut ciphertext, &token, &nonce, &key).expect("encrypt failed");
 
-        let ciphertext = encrypt(&token, 0, &HYDRO_CONTEXT.into(), &self.token_key);
         let opaque_token = encode_config(&ciphertext, URL_SAFE_NO_PAD);
 
         Ok(opaque_token)
@@ -217,9 +245,7 @@ impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
     pub fn spawn(&'static self, listen: SocketAddr) -> JoinHandle<()> {
         use hyper::service::service_fn_ok;
 
-        let sse_handler = move |req: Request<Body>| {
-            self.create_stream(&req)
-        };
+        let sse_handler = move |req: Request<Body>| self.create_stream(&req);
 
         let http_server = hyper::Server::bind(&listen)
             .serve(move || service_fn_ok(sse_handler))
@@ -234,17 +260,14 @@ impl<C: DeserializeOwned + Eq + Hash + FromStr + Send + Serialize> Server<C> {
             .map_err(|e| panic!("Push maintenance failed: {}", e));
 
         thread::spawn(move || {
-            hyper::rt::run(
-                http_server
-                .join(maintenance)
-                .map(|_| ())
-            );
+            hyper::rt::run(http_server.join(maintenance).map(|_| ()));
         })
     }
 
     fn add_client(&self, channel: C, sender: hyper::body::Sender) {
         self.channels
-            .lock().unwrap()
+            .lock()
+            .unwrap()
             .entry(channel)
             .or_insert_with(Default::default)
             .push(Client {
